@@ -155,6 +155,24 @@ PICKLE_ALLOWED_GLOBALS: frozenset[str] = frozenset({
     "builtins.slice",
     "__builtin__.set", "__builtin__.frozenset",
     "copyreg._reconstructor", "copyreg.__newobj__", "copyreg.__newobj_ex__",
+    # Protocols 0 and 1 write Python 2 spellings: every plain class instance
+    # rebuilds as copy_reg._reconstructor(cls, __builtin__.object, state).
+    "__builtin__.dict", "__builtin__.list", "__builtin__.tuple",
+    "__builtin__.bytearray", "__builtin__.complex", "__builtin__.slice",
+    "builtins.object", "__builtin__.object", "copy_reg._reconstructor",
+    # Standard-library value types that ordinary model metadata carries
+    # (timestamps, run ids, prices, config paths). Each constructor builds a
+    # value from its arguments and does no I/O; a pure or concrete path object
+    # is only a name until a method is called on it, and calling one needs a
+    # global this list does not allow.
+    "datetime.datetime", "datetime.date", "datetime.time",
+    "datetime.timedelta", "datetime.timezone",
+    "decimal.Decimal", "uuid.UUID", "fractions.Fraction",
+    "pathlib.PurePosixPath", "pathlib.PureWindowsPath",
+    "pathlib.PosixPath", "pathlib.WindowsPath",
+    # Python 3.13 moved them, and pickles name the new home.
+    "pathlib._local.PurePosixPath", "pathlib._local.PureWindowsPath",
+    "pathlib._local.PosixPath", "pathlib._local.WindowsPath",
     "_codecs.encode",
     "numpy.core.multiarray._reconstruct", "numpy.core.multiarray.scalar",
     "numpy._core.multiarray._reconstruct", "numpy._core.multiarray.scalar",
@@ -164,6 +182,17 @@ PICKLE_ALLOWED_GLOBALS: frozenset[str] = frozenset({
     "torch._utils._rebuild_meta_tensor_no_storage",
     "torch.Size",
     "torch.serialization._get_layout",
+})
+
+# Path classes take a path by design, so the weak "handed a filesystem path"
+# signal says nothing about them. Shell, URL and chained-call evidence still
+# applies.
+_PICKLE_PATH_CONSTRUCTORS: frozenset[str] = frozenset({
+    "pathlib.PurePosixPath", "pathlib.PureWindowsPath",
+    "pathlib.PosixPath", "pathlib.WindowsPath",
+    # Python 3.13 moved them, and pickles name the new home.
+    "pathlib._local.PurePosixPath", "pathlib._local.PureWindowsPath",
+    "pathlib._local.PosixPath", "pathlib._local.WindowsPath",
 })
 
 # Modules whose dtype-specific storage/tensor classes are treated as allowed
@@ -189,12 +218,14 @@ _PICKLE_STORAGE_NAME_RE = re.compile(r"^_?[A-Z][A-Za-z0-9]*(?:Storage|Tensor)$")
 
 # ML frameworks whose namespaces carry no code-execution primitives, paired
 # with a class-shaped leaf (leading capital). The package prefix does the
-# safety work (no exec machinery lives in sklearn.*, scipy.*, transformers.*)
-# and the capital letter does the shape work: estimators, layers, dtypes and
-# config dataclasses are constructed at load, while the genuinely dangerous
-# members of these packages are all lowercase *functions* (dynamic-module
-# loading in transformers, file I/O in sklearn.datasets), which stay in the
-# unknown bucket where the argument-evidence triage sees them.
+# safety work (no exec machinery lives in sklearn.* or scipy.*) and the
+# capital letter does the shape work: estimators, sparse matrices and dtypes
+# are constructed at load, while the genuinely dangerous members of these
+# packages are lowercase *functions* (file I/O in sklearn.datasets), which
+# stay in the unknown bucket where the argument-evidence triage sees them.
+# `transformers` is deliberately NOT here: its namespace is far larger,
+# loads files and code by design, and real pickles use only the handful of
+# training classes listed exactly below.
 # `torch` is deliberately NOT here: torch.utils.collect_env and friends are
 # dangerous submodules, and a CapWords leaf under one
 # (torch.utils.collect_env.SomethingTensor) must stay unknown. torch is
@@ -204,17 +235,23 @@ _PICKLE_STORAGE_NAME_RE = re.compile(r"^_?[A-Z][A-Za-z0-9]*(?:Storage|Tensor)$")
 # shape (measured 2026-08-04: 62 names, all class-shaped bar the exact
 # additions below).
 _PICKLE_ALLOWED_ML_CLASS_ROOTS: frozenset[str] = frozenset({
-    "sklearn", "scipy", "transformers",
+    "sklearn", "scipy",
 })
 _PICKLE_ML_CLASS_NAME_RE = re.compile(r"^_?[A-Z][A-Za-z0-9]*$")
 
-# Measured ordinary-ML machinery with lowercase leaves, so the class-shape
-# rule cannot cover it. Each is a type/constructor with no execution
-# surface, observed in the benign corpus.
+# Measured ordinary-ML machinery the class-shape rule does not cover. Each is
+# a type/constructor observed in the benign corpus.
 _PICKLE_ALLOWED_ML_EXACT: frozenset[str] = frozenset({
     "numpy.float64", "numpy.random.mtrand.RandomState",
     "torch.device", "argparse.Namespace",
     "joblib.numpy_pickle.NumpyArrayWrapper", "scipy.sparse._csr.csr_matrix",
+    # The only transformers globals in the corpus: Trainer's training_args.bin
+    # (measured 2026-10-22, 22 files).
+    "transformers.training_args.TrainingArguments",
+    "transformers.trainer_utils.EvaluationStrategy",
+    "transformers.trainer_utils.HubStrategy",
+    "transformers.trainer_utils.IntervalStrategy",
+    "transformers.trainer_utils.SchedulerType",
 })
 
 
@@ -1693,6 +1730,16 @@ _PICKLE_ALLOWED_STRING_ARG_OK: frozenset[str] = frozenset({
     # sklearn StandardScaler from the quickset benign corpus.
     "numpy.core.multiarray.scalar",
     "numpy._core.multiarray.scalar",
+    # Text is these constructors' legitimate input: Decimal('1.5'), a UUID's
+    # hex form, Fraction('1/3') (how Python 3.10 pickles one), a timezone's
+    # name, and path segments, absolute ones included.
+    "decimal.Decimal", "uuid.UUID", "fractions.Fraction",
+    "datetime.timezone",
+    "pathlib.PurePosixPath", "pathlib.PureWindowsPath",
+    "pathlib.PosixPath", "pathlib.WindowsPath",
+    # Python 3.13 moved them, and pickles name the new home.
+    "pathlib._local.PurePosixPath", "pathlib._local.PureWindowsPath",
+    "pathlib._local.PosixPath", "pathlib._local.WindowsPath",
 })
 
 
@@ -2169,7 +2216,8 @@ def _triage_unknown_pickle_call(
             )
 
     for text in texts:
-        if _PICKLE_ARG_PATH_RE.search(text) and not is_code_builder:
+        if (_PICKLE_ARG_PATH_RE.search(text) and not is_code_builder
+                and call.ref not in _PICKLE_PATH_CONSTRUCTORS):
             # Weak on its own -- `pathlib.PurePosixPath('/home/u/model.bin')`
             # looks identical to `linecache.getline('/etc/passwd', 1)` at the
             # opcode level, and a file read is not code execution either way.

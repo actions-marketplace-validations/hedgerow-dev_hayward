@@ -4,6 +4,34 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 Rule identifiers are part of the public interface and will not be renamed
 within a major version.
 
+## 1.4.0 (2026-10-22)
+
+### Added
+
+- **Load guard.** `import hayward.guard` guards `pickle.load`, `joblib.load`,
+  `numpy.load(allow_pickle=True)` and `torch.load`: each file is scanned
+  first, and while the loader runs every global it resolves on that thread is
+  checked before import. A refusal raises `UnsafeModelError`. Other
+  unpickling in the process, such as `pickle.loads` and multiprocessing, is
+  untouched. The default mode raises the bar but is not a sandbox;
+  `install(strict=True)` refuses every global not on the known-safe list and
+  is the setting for untrusted files. `mode="warn"`, `max_size`,
+  `prescan=False`, `uninstall()` and `HAYWARD_GUARD=off` are supported. The
+  usage guide lists what it does not cover.
+- The `dev` extra includes numpy and joblib again, so CI runs the guard's
+  tests for those loaders.
+
+### Changed
+
+- The known-safe list now includes standard-library value types that model
+  metadata carries: `datetime` dates, times and timezones, `decimal.Decimal`,
+  `uuid.UUID`, `fractions.Fraction` and `pathlib` path classes, plus the
+  Python 2 spellings protocols 0 and 1 write for plain instances. Path
+  classes no longer count a filesystem path argument as evidence.
+- transformers objects are on the known-safe list by exact name only:
+  `TrainingArguments` and the four `trainer_utils` enums Trainer pickles.
+  Other class-shaped transformers names are no longer trusted by shape.
+
 ## 1.2.7 (2026-10-22)
 
 ### Fixed (security)

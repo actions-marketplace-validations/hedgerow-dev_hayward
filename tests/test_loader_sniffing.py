@@ -9,11 +9,16 @@ only: the payloads are hand-built bytes.
 from __future__ import annotations
 
 import bz2
+import datetime
+import decimal
+import fractions
 import gzip
 import io
 import lzma
+import pathlib
 import pickle
 import tarfile
+import uuid
 import zipfile
 import zlib
 
@@ -480,3 +485,57 @@ class TestPython2Names:
     ], ids=["proto2-global", "proto0", "proto2-stack-global"])
     def test_cpickle_loads_is_mapped(self, tmp_path, data):
         assert _critical(_scan(tmp_path, "model.pkl", data))
+
+
+class TestStdlibValueTypes:
+    """Timestamps, prices, ids and config paths in ordinary model metadata are
+    on the known-safe list, under every protocol."""
+
+    VALUES = {
+        "datetime": datetime.datetime(2026, 10, 22, 9, 30, tzinfo=datetime.timezone.utc),
+        "timezone": datetime.timezone(datetime.timedelta(hours=2), "CEST"),
+        "date": datetime.date(2026, 10, 22),
+        "decimal": decimal.Decimal("1.5"),
+        "uuid": uuid.UUID(int=12345),
+        "fraction": fractions.Fraction(1, 3),
+        "posix-path": pathlib.PurePosixPath("/opt/models/a.bin"),
+        "windows-path": pathlib.PureWindowsPath("C:/models/a.bin"),
+    }
+
+    @pytest.mark.parametrize("protocol", range(6))
+    @pytest.mark.parametrize("name", sorted(VALUES))
+    def test_scans_clean(self, tmp_path, name, protocol):
+        data = pickle.dumps(self.VALUES[name], protocol=protocol)
+        assert _scan(tmp_path, "meta.pkl", data) == []
+
+    def test_path_argument_still_counts_for_other_callables(self, tmp_path):
+        data = b"clinecache\ngetline\n(V/etc/hosts\nI1\ntR."
+        findings = _scan(tmp_path, "model.pkl", data)
+        assert any(f.rule_id == "MFV-PICKLE-005" for f in findings)
+
+
+class TestTransformersExactList:
+    """transformers is allowed by exact name only: its namespace loads files
+    and code by design, and real pickles use only Trainer's training classes."""
+
+    @pytest.mark.parametrize("ref", [
+        "transformers.training_args.TrainingArguments",
+        "transformers.trainer_utils.IntervalStrategy",
+        "transformers.trainer_utils.SchedulerType",
+    ])
+    def test_training_classes_are_allowed(self, ref):
+        from hayward._pickle_engine import _classify_pickle_global
+        assert _classify_pickle_global(ref) == "allowed"
+
+    @pytest.mark.parametrize("ref", [
+        "transformers.AutoModel",
+        "transformers.pipelines.TextGenerationPipeline",
+        "transformers.trainer.Trainer",
+    ])
+    def test_other_class_shaped_names_are_not(self, ref):
+        from hayward._pickle_engine import _classify_pickle_global
+        assert _classify_pickle_global(ref) != "allowed"
+
+    def test_sklearn_shape_rule_is_unchanged(self):
+        from hayward._pickle_engine import _classify_pickle_global
+        assert _classify_pickle_global("sklearn.linear_model._logistic.LogisticRegression") == "allowed"
