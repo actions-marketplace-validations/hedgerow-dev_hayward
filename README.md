@@ -49,9 +49,12 @@ verify. Any figures we quote are **self-measured and not independently
 reproducible**; [Accuracy](docs/accuracy.md) sets out what it does and does not
 support, and the harness runs it against your own corpus.
 
-**It tells you when it could not look.** A file it cannot parse produces an
-explicit finding, never silence. Attackers hide payloads behind deliberate
-parse errors, and a clean report should mean the file was read.
+**It tells you when it could not look.** A container it could not fully walk,
+or content it could not verify, gets an explicit coverage finding rather than
+a clean verdict, and a parse error never erases what was already found.
+Attackers hide payloads behind deliberate parse errors, so a payload followed
+by junk still scans as critical. One honest limit: bytes that match no model
+format at all, from the first byte, report nothing.
 
 **It catches gadgets nobody has listed.** Unknown callables are judged by the
 arguments they were handed, not by their name. A URL, a shell command, a host
@@ -77,7 +80,7 @@ all, does not walk past on the strength of its name. A directory scan still
 finds its candidates by extension first, since sniffing a whole tree means
 reading it: [coverage](docs/coverage.md) states that limit.
 
-## Three ways to run it
+## Ways to run it
 
 ```bash
 hayward scan ./models                          # command line
@@ -89,6 +92,10 @@ hayward-gui                                    # desktop window
 from hayward import ModelFileScanner
 findings = ModelFileScanner().scan_directory(Path("models"))
 ```
+
+Or as a [pre-commit hook](docs/usage.md#pre-commit), or as an
+[MCP server](docs/usage.md#coding-agents-mcp) a coding agent calls before it
+loads a model.
 
 And in CI, as a GitHub Action that fails the build and uploads SARIF to code
 scanning:
@@ -111,7 +118,7 @@ could not get into.
 
 ## Documentation
 
-- [Usage](docs/usage.md): CLI reference, exit codes, CI, the GUI, the Python API
+- [Usage](docs/usage.md): CLI reference, exit codes, CI, pre-commit, the GUI, the MCP server, the Python API
 - [Rules](docs/rules.md): all 47 rules with severities and CWE mappings
 - [Coverage](docs/coverage.md): what it does when it cannot read a file, and why that is a finding
 - [How it works](docs/how-it-works.md): how it reads pickle without running it, and how unknown callables are judged by their arguments

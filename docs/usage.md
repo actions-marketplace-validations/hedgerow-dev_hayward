@@ -129,23 +129,19 @@ model-scan:
 
 ### Pre-commit
 
-`hayward scan` accepts several targets, but a hook that forwarded every staged
-filename would scan unrelated files. Scan your models directory instead and use
-`pass_filenames: false`; the `files` pattern then only controls *when* the
-hook runs (whenever a matching file is staged). Point the entry at whatever
-directory holds your model files.
+Add Hayward to `.pre-commit-config.yaml`:
 
 ```yaml
 repos:
-  - repo: local
+  - repo: https://github.com/hedgerow-dev/hayward
+    rev: v1.2.6
     hooks:
       - id: hayward
-        name: scan model files
-        entry: hayward scan ./models --fail-on high
-        language: system
-        pass_filenames: false
-        files: '\.(pt|pth|pkl|bin|safetensors|gguf|h5|keras|onnx|npy|npz|joblib)$'
 ```
+
+The hook scans each staged file whose extension Hayward reads and blocks the
+commit on any finding at `high` or above. To change the threshold, override
+`args`, for example `args: [--fail-on, critical]`.
 
 ## Desktop
 
@@ -163,6 +159,25 @@ checkbox controls whether INFO findings are listed, the same choice the CLI's
 Built on tkinter, which ships with Python, so the desktop app adds no
 dependency. The scan runs on a worker thread, so a large directory does not
 freeze the window.
+
+## Coding agents (MCP)
+
+```bash
+pip install "hayward[mcp]"
+claude mcp add hayward -- hayward mcp
+```
+
+`hayward mcp` runs a stdio MCP server with one tool, `scan_path(path,
+fail_on="high")`. It returns JSON with the findings and a `verdict`:
+
+- `blocked`: a finding at or above `fail_on`, the same gate as `--fail-on`.
+- `incomplete`: nothing reached the gate, but a file was not fully read.
+- `clean`: neither.
+
+A missing path comes back as a tool error. The tool is read-only, never loads
+the model and makes no network calls, so an agent can be told to scan any
+model file before loading it. The extra adds the official MCP Python SDK
+(MIT); the core install is unchanged.
 
 ## Python
 
