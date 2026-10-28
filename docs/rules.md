@@ -71,7 +71,8 @@ CRITICAL.
 
 | Rule | Severity | CWE | Fires when |
 |------|----------|-----|------------|
-| `MFV-TORCH-001` | HIGH | 94 | A torch zip (`.pt`/`.ptl`/TorchScript/torch.package) carries executable Python **source** members (`code/*.py` or a `.data/` package layout) that `torch.jit` or `PackageImporter` runs on load |
+| `MFV-TORCH-001` | LOW | — | TorchScript graph source or Python source in a torch.package layout is present. A trust-boundary signal, not proof of a malicious operation. Members must match a container marker at the same archive root |
+| `MFV-TORCH-002` | HIGH | 94 | Packaged Python contains a statically resolved explicit execution call (`eval`, `exec`, OS shell, or subprocess). Reports source member and operation line; import/invocation reachability and intent remain unverified |
 | `MFV-KERAS-001` | HIGH | 502 | Lambda layer embedding a marshalled Python function |
 | `MFV-KERAS-002` | INFO | 502 | Layer class not on the known-builtin list |
 | `MFV-ONNX-001` | HIGH | 502, 94 | Custom op with documented code-execution behaviour (PyOp/PythonOp) |
@@ -132,7 +133,9 @@ Known blind spots as of 2026-08-05:
   cannot be bundled. With an extractor present the archive is unpacked to a
   temporary directory and every member scanned; without one, `MFV-7Z-001`
   reports the gap. One malicious sample in picklescan's own suite is
-  missed on a machine with no extractor.
+  missed on a machine with no extractor. An archive over 500MB, a failed
+  listing, or an extraction that writes past the size limit is reported as
+  `MFV-SKIP-003` rather than scanned.
 - **Nested archives are scanned to a depth of 4.** Beyond that `MFV-SKIP-003`
   reports the gap rather than recursing.
 - **`MFV-PICKLE-004` is the unknown-global bucket**, structurally the same tier
@@ -158,4 +161,3 @@ a rule in this pass. Stated here so the gap is explicit rather than silent:
 - **`shelve` / `dbm`** stores are platform-specific dbm backends wrapping
   pickles, rare as a model-distribution format and high effort to read
   portably. Out of scope until one shows up in the wild.
-

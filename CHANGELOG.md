@@ -4,6 +4,161 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 Rule identifiers are part of the public interface and will not be renamed
 within a major version.
 
+## 1.4.1 (2026-10-23)
+
+### Added
+
+- `server.json` for the official MCP Registry, listing `hayward mcp` as
+  `io.github.hedgerow-dev/hayward`. Clients start it with
+  `uvx --with "mcp>=2.3,<3" hayward mcp`, so the core install keeps its one
+  dependency.
+
+### Changed
+
+- The PyPI page carries the current README: the load guard and MCP demo
+  sections.
+
+## 1.4.0 (2026-10-22)
+
+### Added
+
+- **Load guard.** `import hayward.guard` guards `pickle.load`, `joblib.load`,
+  `numpy.load(allow_pickle=True)` and `torch.load`: each file is scanned
+  first, and while the loader runs every global it resolves on that thread is
+  checked before import. A refusal raises `UnsafeModelError`. Other
+  unpickling in the process, such as `pickle.loads` and multiprocessing, is
+  untouched. The default mode raises the bar but is not a sandbox;
+  `install(strict=True)` refuses every global not on the known-safe list and
+  is the setting for untrusted files. `mode="warn"`, `max_size`,
+  `prescan=False`, `uninstall()` and `HAYWARD_GUARD=off` are supported. The
+  usage guide lists what it does not cover.
+- The `dev` extra includes numpy and joblib again, so CI runs the guard's
+  tests for those loaders.
+
+### Changed
+
+- The known-safe list now includes standard-library value types that model
+  metadata carries: `datetime` dates, times and timezones, `decimal.Decimal`,
+  `uuid.UUID`, `fractions.Fraction` and `pathlib` path classes, plus the
+  Python 2 spellings protocols 0 and 1 write for plain instances. Path
+  classes no longer count a filesystem path argument as evidence.
+- transformers objects are on the known-safe list by exact name only:
+  `TrainingArguments` and the four `trainer_utils` enums Trainer pickles.
+  Other class-shaped transformers names are no longer trusted by shape.
+
+## 1.2.7 (2026-10-22)
+
+### Fixed (security)
+
+- **Legacy tar members read through links.** A `pickle`, `storages`,
+  `tensors` or `sys_info` member that is a symlink, a hard link or of an
+  unknown type is read the way torch.load reads it. One that resolves to
+  nothing readable, or is larger than the member cap, reports a coverage
+  gap; an oversized one still has its start scanned.
+- **Oversized tar checkpoints.** Past the 500MB cap, a file that torch.load
+  reads as a tar is walked as a tar, also when a zip is appended to it.
+- **Mixed lzma and xz streams.** After the first stream, each one is decoded
+  in either format, as `lzma.LZMAFile` does. A later stream that does not
+  decode reports `MFV-SKIP-003` instead of ending the read silently.
+- **`.npy` headers read as numpy reads them.** `descr` spellings such as
+  `'object'` and structured fields count as object dtypes, Python 2 `L`
+  integers in the header are accepted, and a header that does not parse
+  reports `MFV-SKIP-003`.
+- **joblib arrays inside the pickle.** The scanner skips the array data joblib
+  writes after each array, as joblib.load does, and scans the rest of the
+  pickle. An array it cannot size reports `MFV-SKIP-003`.
+- **Python 2 names.** Below protocol 3, globals are classified under the
+  Python 3 names pickle maps them to (`cPickle.loads` as `pickle.loads`).
+
+## 1.2.6 (2026-10-21)
+
+Two new ways to run the scanner, and scanner fixes for files the loaders
+read differently from their names. No rule changes.
+
+### Added
+
+- **pre-commit hook.** `.pre-commit-hooks.yaml` with hook id `hayward`. Its
+  file pattern is generated from the scanner's own extension list, and a test
+  fails if the two drift.
+- **MCP server for coding agents.** `hayward mcp` runs a stdio server with one
+  read-only tool, `scan_path`, returning `blocked`, `clean` or `incomplete`.
+  Needs the new optional extra: `pip install "hayward[mcp]"`. The core
+  install still has one dependency.
+
+### Changed
+
+- The README states the coverage guarantee precisely: bytes that match no
+  model format from the first byte report nothing.
+
+### Fixed (security)
+
+The loaders decide what a file is by its bytes. The scanner sometimes decided
+by its name, and passed content clean that a loader would run.
+
+- **Pickle-family files are scanned whatever they hold.** A protocol 0 or 1
+  pickle named `.pth` is scanned (path-configuration files still are not). A
+  gzip, bz2, xz or lzma pickle under any pickle extension is decompressed and
+  scanned, as zlib already was. lzma is detected on the same two bytes joblib
+  checks, and joblib's pre-0.10 `ZF` layout is read. An lz4 joblib file, or a
+  compressed stream that will not decompress, reports `MFV-SKIP-003`.
+  Concatenated compressed streams are read through to the last one, as
+  joblib's bz2, xz and lzma readers do. A
+  compressed pickle under a pickle extension (`joblib.dump` to `model.pkl`
+  with `compress=`) is scanned as joblib and no longer reports
+  `MFV-CONFUSE-001`.
+- **Legacy tar checkpoints.** A `.pt` (or other pickle extension) that is an
+  uncompressed tar is walked as torch.load reads it, with `storages`,
+  `tensors`, `pickle` and `sys_info` scanned whatever byte they open with,
+  including when a zip is appended to the tar.
+- **Bytes in front of a zip.** A pickle followed by a zip archive is scanned
+  as a pickle too, since the loaders read it from byte 0. This holds past the
+  500MB cap.
+- **NumPy by content.** An object `.npy` named `.npz` is scanned, and so is
+  an `.npz` member that lacks the `.npy` suffix. A zip under a NumPy name that
+  is not all arrays, such as a torch checkpoint, reports `MFV-CONFUSE-001`
+  and is scanned as one.
+- **Pickles under protobuf names.** A pickle, compressed pickle, zip or `.npy`
+  named `.onnx`, or any `.pb` other than `saved_model.pb`, is scanned. A zip
+  named `.pb` is scanned past the size cap too.
+## 1.2.5 (2026-10-03)
+
+- Calibrate `MFV-TORCH-001` as a LOW source-presence signal. Distinguish
+  TorchScript graph representations from Python modules in torch.package;
+  unrelated `.py` files beside a checkpoint no longer establish either format.
+- Add `MFV-TORCH-002` for statically resolved execution operations in packaged
+  Python. Import aliases are supported; shadowed and unresolved calls are not
+  convicted. Source is parsed, never imported or executed. Reachability and
+  malicious intent are not claimed.
+- Bound Python source inspection by per-member, total-byte, and member-count
+  budgets. Unreadable, invalid, or over-budget source produces `MFV-SKIP-002`.
+  Existing pickle and archive-structure findings remain independent.
+
+## 1.2.4 (2026-10-02)
+
+Resource and fail-closed hardening, ported from the model scanner that Rowan
+carried before it switched to depending on Hayward. No rule changes.
+
+### Fixed
+
+- **7z archives are bounded by what extraction actually writes.** A listing's
+  sizes are claims; extraction is now watched and stopped once a member passes
+  `MAX_ZIP_MEMBER_BYTES`, the total passes 500MB, or it writes more than 1,000
+  files (`MFV-SKIP-003`, `skipped_reason: extraction_quota`). The tree is
+  measured every 50ms and after exit, so a fast disk can overshoot by one
+  interval's writes. Extractor stderr no longer goes to an unread pipe, which
+  let a noisy archive stall the scan for the full 300-second timeout.
+- **7z archives fail closed on a bad listing.** An archive over 500MB is never
+  handed to the extractor, and a listing that fails, overflows 2MB, names more
+  than 1,000 members or claims an oversized member is reported as not scanned
+  instead of being extracted. A non-numeric `Size =` line still counts as zero;
+  the quota above now bounds it.
+- **`.keras` `config.json` reads are capped.** The member was decompressed in
+  full: a 408KB archive expanding to 400MB drove memory to 1.4GB. Oversized
+  configs are reported as `MFV-SKIP-003` (`skipped_reason: oversized`).
+- **TFLite layout checks are bounded.** Aliased subgraph offsets could replay
+  one inflated tensor table thousands of times: a 64KB file took 14 seconds. The
+  replay now stops at a file-wide budget and reports `MFV-TFLITE-001`.
+
 ## 1.2.3 (2026-08-28)
 
 A scaled comparative benchmark (128 real public models, seven formats) surfaced

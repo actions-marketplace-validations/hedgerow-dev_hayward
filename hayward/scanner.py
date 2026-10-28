@@ -29,6 +29,8 @@ import io
 import json
 import logging
 import lzma
+import os
+import pickletools
 import re
 import shutil
 import stat
@@ -36,6 +38,9 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import threading
+import time
+import tokenize
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -198,6 +203,7 @@ from hayward._tensors import _string_string_entry as _string_string_entry
 from hayward._tensors import _unsafe_name_reason as _unsafe_name_reason
 from hayward.findings import Category, Finding, Severity
 from hayward.signatures import find_signature_artifacts, signature_findings
+from hayward.torch_source import classify_sources, package_source_findings, source_presence
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +320,67 @@ def _skip_unverified_finding(
     )
 
 
+def _unparsed_pickle_finding(file_path: Path) -> Finding:
+    return _skip_unverified_finding(
+        file_path,
+        "The content did not parse as a pickle stream, but the loaders for "
+        "this file unpickle it regardless.",
+        metadata={"skipped_reason": "pickle_unparsed"},
+    )
+
+
+def _is_plain_tar(data: bytes) -> bool:
+    """Whether `data` opens as an uncompressed tar, the only kind torch.load's
+    legacy reader accepts. Parses the first header, not the whole archive."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:"):
+            return True
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return False
+
+
+def _strip_python2_longs(header: str) -> str:
+    """numpy's _filter_header: drop the `L` that follows an integer in a
+    header written by Python 2 (`(1L,)`), which literal_eval rejects."""
+    tokens = []
+    after_number = False
+    for token in tokenize.generate_tokens(io.StringIO(header).readline):
+        if not (after_number and token.type == tokenize.NAME and token.string == "L"):
+            tokens.append(token)
+        after_number = token.type == tokenize.NUMBER
+    return tokenize.untokenize(tokens)
+
+
+def _npy_descr_has_object(descr: Any) -> bool:
+    """Whether numpy builds a dtype holding Python objects from a .npy
+    `descr`, walked the way numpy's descr_to_dtype walks it: a string is one
+    dtype, a tuple is (base, shape), anything else is a list of fields
+    (name, descr) or (name, descr, shape).
+
+    A dtype string counts as object when it names one anywhere ('O', 'object',
+    'object_', numpy 2's StringDType 'T', or a field of any of them in a
+    comma-separated spec), a superset of the object dtype strings numpy.dtype
+    accepts. A descr whose shape this walk cannot
+    follow counts as object too: the data is then read as a pickle, which is
+    harmless when it is not one.
+    """
+    if isinstance(descr, str):
+        return "O" in descr or "T" in descr or "object" in descr
+    try:
+        if isinstance(descr, tuple):
+            return _npy_descr_has_object(descr[0])
+        for field in descr:
+            if len(field) == 2:
+                _name, sub = field
+            else:
+                _name, sub, _shape = field
+            if _npy_descr_has_object(sub):
+                return True
+    except (TypeError, ValueError, IndexError, RecursionError):
+        return True
+    return False
+
+
 class ModelFormat(str, Enum):
     PICKLE = "pickle"
     SAFETENSORS = "safetensors"
@@ -332,6 +399,13 @@ class ModelFormat(str, Enum):
     SEVENZ = "sevenz"
     PMML = "pmml"
     UNKNOWN = "unknown"
+
+
+# What torch.load, numpy.load, joblib.load or pickle.load unpickles once it
+# has sniffed the bytes, whatever the file is called.
+_PICKLE_BEARING_FORMATS = frozenset({
+    ModelFormat.PICKLE, ModelFormat.JOBLIB, ModelFormat.PYTORCH_ZIP, ModelFormat.NUMPY,
+})
 
 
 # Directory names never worth walking: version control, virtualenvs, build
@@ -353,12 +427,35 @@ SKIP_DIR_NAMES = frozenset({
 # still compressed, found no opcodes, and passed clean. A published bypass
 # proof of concept exploits exactly that: payload2_lzma_rce.joblib carries
 # builtins.eval("__import__('os').popen('id').read()") behind lzma.
+#
+# lzma is matched on the two bytes joblib itself checks (5d 00): the next byte
+# is the low byte of the dictionary size, which is non-zero for a small one.
 _COMPRESSED_STREAM_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"\x1f\x8b", "gzip"),
     (b"BZh", "bz2"),
     (b"\xfd7zXZ\x00", "xz"),
-    (b"\x5d\x00\x00", "lzma"),
+    (b"\x5d\x00", "lzma"),
 )
+
+# joblib < 0.10 wrote "ZF", the uncompressed length as hex padded to 19
+# characters, an optional space, then a zlib stream. joblib.load still reads
+# it. lz4 is joblib's other codec; the standard library cannot decompress it.
+_JOBLIB_ZFILE_PREFIX = b"ZF"
+_JOBLIB_ZFILE_HEADER_LEN = 2 + 19
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+# numpy.load treats either as an .npz; the second is an empty archive.
+_NPZ_MAGICS = (b"PK\x03\x04", b"PK\x05\x06")
+
+
+def _joblib_compression(data: bytes) -> tuple[str | None, bytes]:
+    """The codec joblib.load would decompress `data` with (None if none), and
+    the compressed stream itself, which for the ZF layout starts past its
+    header."""
+    if data.startswith(_JOBLIB_ZFILE_PREFIX):
+        return "zlib", data[_JOBLIB_ZFILE_HEADER_LEN:].removeprefix(b" ")
+    if data.startswith(_LZ4_FRAME_MAGIC):
+        return "lz4", data
+    return _sniff_compression(data), data
 
 
 def _sniff_compression(data: bytes) -> str | None:
@@ -570,6 +667,12 @@ class ModelFileScanner:
         # hayward.signatures). Detection only: this tool does no cryptographic
         # verification and claims none.
         self.check_signatures = False
+        # Off for the CLI, where "the walk could not read a single opcode" is
+        # silence by measured design (see _scan_pickle). A load-time caller turns
+        # it on: it runs the loader next, and a walk stricter than the real
+        # unpickler is the one way left past it, so content a loader would
+        # unpickle and the walk could not read is reported as a coverage gap.
+        self.report_unparsed_pickles = False
         self._format_map: dict[str, ModelFormat] = {
             ".pkl": ModelFormat.PICKLE,
             ".pickle": ModelFormat.PICKLE,
@@ -643,8 +746,11 @@ class ModelFileScanner:
         }
 
 
-    def scan_file(self, file_path: Path) -> list[Finding]:
+    def scan_file(self, file_path: Path, *, _as_suffix: str | None = None) -> list[Finding]:
         """Scan a single model file.
+
+        `_as_suffix` is internal, for a load-time caller: it scans the file as the
+        format of the loader about to read it, whatever the file is named.
 
         Never raises on input problems: any failure degrades to an
         MFV-SKIP-003 coverage finding instead of propagating, because one
@@ -654,7 +760,7 @@ class ModelFileScanner:
         BaseException, not Exception, and propagate untouched.
         """
         try:
-            findings = self._scan_file_dispatch(file_path)
+            findings = self._scan_file_dispatch(file_path, (_as_suffix or file_path.suffix).lower())
         except OSError:
             findings = [_skip_unverified_finding(
                 file_path,
@@ -683,7 +789,7 @@ class ModelFileScanner:
 
         return findings
 
-    def _scan_file_dispatch(self, file_path: Path) -> list[Finding]:
+    def _scan_file_dispatch(self, file_path: Path, ext: str) -> list[Finding]:
         """The scan_file body, wrapped by the exception firewall above."""
         # Before any format dispatch: a Git LFS pointer is a placeholder a
         # few lines long, whatever extension it wears, and the content it
@@ -692,8 +798,8 @@ class ModelFileScanner:
         if lfs_finding is not None:
             return [lfs_finding]
 
-        ext = file_path.suffix.lower()
         fmt = self._format_map.get(ext, ModelFormat.UNKNOWN)
+        other_pb = False
 
         # An extension the map doesn't name is not a reason to stop; it falls
         # through to the content sniff further down.
@@ -715,7 +821,11 @@ class ModelFileScanner:
             if name == "keras_metadata.pb":
                 fmt = ModelFormat.KERAS_METADATA
             elif name != "saved_model.pb":
-                return []
+                # Any other .pb is left alone unless its bytes are something a
+                # pickle loader runs: torch.load and the rest never look at
+                # the name, so a pickle called `graph.pb` is still live.
+                fmt = ModelFormat.UNKNOWN
+                other_pb = True
 
         if fmt == ModelFormat.NEMO:
             # Checked before the size gate below: that cap exists to bound
@@ -776,8 +886,57 @@ class ModelFileScanner:
             # that a ZIP container never charges. The classifier here calls
             # those payloads denied once it actually reads them
             # (`runpy._run_code`, `__builtin__.eval`, `__builtin__.exec`).
+            #
+            # torch.load's own order decides between the two containers: zip
+            # only when byte 0 is the zip magic, otherwise an uncompressed tar
+            # if one opens, read member by member off disk like any tar.
+            magic = _read_file_magic(file_path, 4)
+            if magic != b"PK\x03\x04":
+                try:
+                    with tarfile.open(file_path, "r:"):
+                        is_tar = True
+                except (tarfile.TarError, OSError, EOFError, ValueError):
+                    is_tar = False
+                if is_tar:
+                    findings = self._scan_tar_pickles(file_path)
+                    if zipfile.is_zipfile(file_path):
+                        findings += self._scan_pytorch_zip(file_path)
+                    # The tar's first header is a pickle to pickle.load and
+                    # joblib.load, as in the in-cap case below.
+                    with open(file_path, "rb") as handle:
+                        prefix = handle.read(self.MAX_SCAN_BYTES)
+                    findings.extend(self._scan_pickle(
+                        file_path, prefix, loader_unpickles=ext != ".pt"))
+                    # Read as a flat pickle, the file is still past the cap:
+                    # an opcode can carry the stream beyond the prefix.
+                    findings.append(Finding(
+                        rule_id="MFV-SKIP-001",
+                        message=f"Model file exceeds {self.MAX_SCAN_BYTES // 1_000_000}MB scan "
+                                f"limit ({file_size // 1_000_000}MB). Its tar members were "
+                                f"walked, but as a flat pickle (how pickle.load and "
+                                f"joblib.load read it) only the first "
+                                f"{self.MAX_SCAN_BYTES // 1_000_000}MB were analysed. NOT a "
+                                f"clean verdict for the rest.",
+                        severity=Severity.LOW,
+                        category=Category.AI_ML,
+                        file_path=str(file_path),
+                        confidence=0.50,
+                        metadata={"file_size": file_size, "skipped_reason": "oversized"},
+                    ))
+                    return findings
             if zipfile.is_zipfile(file_path):
-                return self._scan_pytorch_zip(file_path)
+                findings = self._scan_pytorch_zip(file_path)
+                if magic != b"PK\x03\x04":
+                    # Bytes in front of the archive are a pickle to the
+                    # loaders; see the in-cap case below. A pickle never needs
+                    # more than the cap to be analysed.
+                    with open(file_path, "rb") as handle:
+                        prefix = handle.read(self.MAX_SCAN_BYTES)
+                    findings.extend(self._scan_pickle(file_path, prefix, loader_unpickles=True))
+                return findings
+
+            if other_pb:
+                return []  # as before: an unrelated protobuf, not worth a skip
 
             # Same argument for HDF5. A Keras .h5 keeps its architecture in a
             # `model_config` attribute of a few kilobytes; the rest is weights.
@@ -825,7 +984,7 @@ class ModelFileScanner:
         # named `*.json`, and sniffing every '{'-led blob in a tree as a model
         # config would false-positive on the unrelated JSON that litters a
         # repo (package manifests, tokenizer vocab, dataset shards).
-        if file_path.suffix.lower() == ".json":
+        if ext == ".json":
             try:
                 # json.loads takes bytes directly and auto-detects the UTF
                 # encoding. The catch set mirrors the other bounded JSON parses
@@ -860,8 +1019,28 @@ class ModelFileScanner:
             # can't positively identify is skipped, since an unidentified file
             # with an unclaimed extension isn't evidence of a model at all.
             fmt = self._sniff_format(data) or ModelFormat.UNKNOWN
-            if fmt == ModelFormat.UNKNOWN:
+            if fmt == ModelFormat.UNKNOWN and data[:4] != b"PK\x03\x04" and _is_plain_tar(data):
+                # torch.load reads a legacy tar checkpoint under any name
+                # (`pytorch_model.bin`), as the oversized branch above does.
+                fmt = ModelFormat.PICKLE
+            if fmt == ModelFormat.UNKNOWN or (other_pb and not self._is_pickle_bearing(data, fmt)):
                 return []
+
+        # Modern PyTorch checkpoints (.pt/.pth/.ckpt) are ZIP archives that
+        # wrap the real pickle (archive/data.pkl). torch.save() has produced
+        # these by default since PyTorch 1.6. Scan inside the archive; fall
+        # back to flat-pickle scanning for the legacy non-zip format. This is
+        # tracked separately from `fmt` because a zip-wrapped checkpoint
+        # already gets its own (member-level) parse-failure handling inside
+        # _scan_pytorch_zip -- the extension-confusion check below only
+        # applies to the flat-pickle path.
+        is_zip_pickle = fmt == ModelFormat.PICKLE and zipfile.is_zipfile(file_path)
+        # torch.load takes a file that does not open with the zip magic as a
+        # legacy tar first, even when zipfile also finds an archive at its end.
+        is_tar_pickle = (
+            fmt == ModelFormat.PICKLE and data[:4] != b"PK\x03\x04" and _is_plain_tar(data)
+        )
+        codec = _joblib_compression(data)[0] if fmt == ModelFormat.PICKLE else None
 
         # `.pth` is an overloaded extension: besides a PyTorch checkpoint it is
         # also Python's own path-configuration file, a plain-text list of
@@ -876,22 +1055,39 @@ class ModelFileScanner:
         # pickle, which always opens with the PROTO opcode `\x80`. Same
         # reasoning as the `saved_model.pb` guard above -- an extension that
         # other tooling also uses is not on its own evidence of the format.
-        if file_path.suffix.lower() == ".pth" and not (
-            data[:1] == b"\x80" or data[:4] == b"PK\x03\x04"
+        #
+        # The magic bytes alone were too narrow: torch.load, joblib.load and
+        # numpy.load also run a protocol 0/1 pickle (no PROTO opcode), a
+        # compressed one (joblib) and a legacy tar (torch) found under this
+        # name. A path-configuration file is none of those and does not walk
+        # as a pickle stream.
+        if ext == ".pth" and not (
+            data[:1] == b"\x80" or data[:4] == b"PK\x03\x04" or is_tar_pickle
+            or codec is not None or self._is_parseable_pickle(data)
         ):
             return []
 
-        # Modern PyTorch checkpoints (.pt/.pth/.ckpt) are ZIP archives that
-        # wrap the real pickle (archive/data.pkl). torch.save() has produced
-        # these by default since PyTorch 1.6. Scan inside the archive; fall
-        # back to flat-pickle scanning for the legacy non-zip format. This is
-        # tracked separately from `fmt` because a zip-wrapped checkpoint
-        # already gets its own (member-level) parse-failure handling inside
-        # _scan_pytorch_zip -- the extension-confusion check below only
-        # applies to the flat-pickle path.
-        is_zip_pickle = fmt == ModelFormat.PICKLE and zipfile.is_zipfile(file_path)
-
-        findings = self._run_scanner_for_format(fmt, file_path, data, is_zip_pickle=is_zip_pickle)
+        if is_tar_pickle:
+            # torch.load opens a non-zip checkpoint as an uncompressed tar
+            # first and unpickles its members.
+            findings = self._scan_tar_pickles(file_path)
+            if is_zip_pickle:
+                findings += self._scan_pytorch_zip(file_path)
+        elif codec is not None and not is_zip_pickle:
+            # joblib.load decompresses these under any name, and reports what
+            # it cannot decompress; that is not an extension mismatch.
+            findings = self._scan_joblib(file_path, data)
+        else:
+            findings = self._run_scanner_for_format(fmt, file_path, data, is_zip_pickle=is_zip_pickle)
+        if (is_zip_pickle or is_tar_pickle) and data[:4] != b"PK\x03\x04":
+            # zipfile finds an archive by the end record, so it accepts one
+            # with anything in front of it, and a tar's first member name sits
+            # at byte 0. pickle.load and joblib.load read from byte 0, and so
+            # does torch.load once a file is neither zip nor tar: to them
+            # these bytes are a pickle. Scanned as `.pt` it is torch.load,
+            # which reads a tar as a tar, so there it is not a gap.
+            findings.extend(self._scan_pickle(
+                file_path, data, loader_unpickles=not (is_tar_pickle and ext == ".pt")))
 
         # Extension-spoofing check (issue #152): a format-specific parse
         # failure alone doesn't distinguish "corrupted file" from "wrong
@@ -904,12 +1100,19 @@ class ModelFileScanner:
         # identifiable structural-parse-failure signal AND the raw bytes
         # match a *different* known format -- never invents a mismatch on a
         # file that's simply corrupted (see _sniff_format/_extension_parse_failed).
-        if not is_zip_pickle and self._extension_parse_failed(fmt, file_path, data, findings):
+        if (
+            not is_zip_pickle and not is_tar_pickle and codec is None
+            and self._extension_parse_failed(fmt, file_path, data, findings)
+        ):
             sniffed = self._sniff_format(data)
+            if fmt == ModelFormat.ONNX and not self._is_pickle_bearing(data, sniffed):
+                sniffed = None
             if sniffed is not None and sniffed != fmt:
                 findings = list(findings)
                 findings.append(self._confuse_finding(file_path, fmt, sniffed))
                 findings.extend(self._run_scanner_for_format(sniffed, file_path, data))
+            elif fmt == ModelFormat.PICKLE and not findings and self.report_unparsed_pickles:
+                findings = [_unparsed_pickle_finding(file_path)]
 
         exec_hits = _find_embedded_executables(data)
         if exec_hits:
@@ -1004,14 +1207,19 @@ class ModelFileScanner:
           - NUMPY: neither the .npy header nor (for .npz) the zip container
             parsed.
 
-        Deliberately NOT wired for ONNX/TF_SAVEDMODEL or JOBLIB: their scan
-        methods degrade to "found nothing" on non-matching bytes rather than
-        raising or emitting a dedicated corrupted finding (ONNX/TF's
-        schema-less protobuf walker just stops early; joblib always falls
-        through to a plain pickle scan of whatever bytes it's given), so
-        there's no signal to distinguish "wrong format entirely" from "valid
-        but uninteresting file" without risking false MFV-CONFUSE-001s on
-        legitimate, sparse files.
+          - ONNX, narrowly: the confusion counts only when the bytes sniff as
+            something a pickle loader runs (a pickle, a compressed pickle, a
+            zip, an .npy). torch.load and the rest ignore the name, and a real
+            ModelProto matches none of those signatures.
+
+        Deliberately NOT wired for TF_SAVEDMODEL or JOBLIB, nor for ONNX
+        beyond the case above: their scan methods degrade to "found nothing"
+        on non-matching bytes rather than raising or emitting a dedicated
+        corrupted finding (ONNX/TF's schema-less protobuf walker just stops
+        early; joblib always falls through to a plain pickle scan of whatever
+        bytes it's given), so there's no signal to distinguish "wrong format
+        entirely" from "valid but uninteresting file" without risking false
+        MFV-CONFUSE-001s on legitimate, sparse files.
         """
         if fmt == ModelFormat.SAFETENSORS:
             return bool(findings) and findings[0].rule_id in {
@@ -1023,9 +1231,18 @@ class ModelFileScanner:
             return not self._is_parseable_pickle(data)
         if fmt == ModelFormat.KERAS:
             return data[:8] != HDF5_SIGNATURE and not zipfile.is_zipfile(file_path)
+        if fmt == ModelFormat.ONNX:
+            # Every ModelProto an exporter writes opens with ir_version (field
+            # 1, varint): tag 0x08, which no pickle-loader format starts with.
+            # Anything else is sniffed, and only counts if a pickle loader
+            # would run it (checked by the caller).
+            return data[:1] != b"\x08"
         if fmt == ModelFormat.NUMPY:
-            if file_path.suffix.lower() == ".npz":
-                return not zipfile.is_zipfile(file_path)
+            if data[:4] in _NPZ_MAGICS:
+                # numpy reads any zip as an .npz, but a zip that is not all
+                # arrays (a torch checkpoint, say) is still run by torch.load.
+                return not zipfile.is_zipfile(file_path) or (
+                    self._sniff_format(data) != ModelFormat.NUMPY)
             return self._parse_npy_header(data) is None
         return False
 
@@ -1072,6 +1289,23 @@ class ModelFileScanner:
         except Exception:
             return False
         return True
+
+    def _is_pickle_bearing(self, data: bytes, sniffed: ModelFormat | None) -> bool:
+        """Whether bytes under a protobuf extension, sniffed as `sniffed`, are
+        something torch.load, numpy.load, joblib.load or pickle.load runs. A
+        pickle has to open with PROTO or walk through to its STOP here: the
+        sniff's partial-walk test alone is too weak, since protobuf bytes
+        resolve a stray GLOBAL by chance.
+        """
+        if sniffed != ModelFormat.PICKLE:
+            return sniffed in _PICKLE_BEARING_FORMATS
+        if data[:1] == b"\x80":
+            return True
+        with contextlib.suppress(Exception):
+            for op, _arg, _pos in pickletools.genops(io.BytesIO(data)):
+                if op.name == "STOP":
+                    return True
+        return False
 
     def _sniff_format(self, data: bytes) -> ModelFormat | None:
         """Identify which (if any) of the known `ModelFormat` container
@@ -1134,14 +1368,18 @@ class ModelFileScanner:
                 if isinstance(parsed, dict):
                     return ModelFormat.SAFETENSORS
 
-        # joblib's compressed variant: a zlib stream that inflates to a
-        # parseable pickle. Checked before the bare pickle-opcode fallback
-        # since a compressed joblib file's raw bytes won't themselves parse
-        # as pickle opcodes.
-        if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5E, 0x9C, 0xDA):
+        # joblib's compressed variant: a stream in any codec joblib.load
+        # detects that inflates to a parseable pickle. Checked before the bare
+        # pickle-opcode fallback since a compressed joblib file's raw bytes
+        # won't themselves parse as pickle opcodes. joblib.load decompresses
+        # these whatever the file is called, so a gzip pickle named `.pkl` is
+        # as live as one named `.joblib`.
+        codec, stream = _joblib_compression(data)
+        if codec is not None and codec != "lz4":
             try:
-                decompressed = self._decompress_zlib_capped(data, self.MAX_ZIP_MEMBER_BYTES)
-            except zlib.error:
+                decompressed, _complete = self._decompress_capped(
+                    stream, self.MAX_ZIP_MEMBER_BYTES, codec)
+            except (zlib.error, OSError, EOFError, lzma.LZMAError):
                 decompressed = None
             if decompressed is not None and self._is_parseable_pickle(decompressed):
                 return ModelFormat.JOBLIB
@@ -1289,13 +1527,21 @@ class ModelFileScanner:
 
     # ── Pickle scanning ───────────────────────────────────────────
 
-    def _scan_pickle(self, file_path: Path, data: bytes) -> list[Finding]:
+    def _scan_pickle(
+        self, file_path: Path, data: bytes, loader_unpickles: bool = False,
+    ) -> list[Finding]:
         """Scan a pickle file by resolving every GLOBAL/STACK_GLOBAL reference
         to its `module.name` callable and classifying each against an
         allow/deny list, instead of flagging the mere presence of REDUCE-style
         opcodes (which appear in essentially every real pickle -- an
         ``OrderedDict``, a tensor rebuild, ... -- and previously gave a benign
         state_dict the same CRITICAL verdict as actual malware).
+
+        `loader_unpickles` is for callers that know a loader unpickles exactly
+        these bytes (a joblib stream, an object .npy payload, torch's
+        data.pkl), unlike a blob merely sniffed out of a container. With
+        `report_unparsed_pickles` set, a stream there that the walk cannot read
+        at all is reported as a coverage gap.
         """
         findings: list[Finding] = []
 
@@ -1364,7 +1610,12 @@ class ModelFileScanner:
                 # this same walk reads: a stream with no resolvable global
                 # cannot carry a working payload, so there is no evasion to
                 # report. This is loader parity, not a blind spot.
-                pass
+                #
+                # Unless the caller knows a loader unpickles these very bytes:
+                # then the walk being stricter than the real unpickler is the
+                # one way left to hide a payload, so it is not a clean verdict.
+                if loader_unpickles and self.report_unparsed_pickles:
+                    findings.append(_unparsed_pickle_finding(file_path))
             return findings
 
         if memo_profile.walk_budget_exceeded:
@@ -1376,6 +1627,17 @@ class ModelFileScanner:
                 "The pickle walk exceeded its simulated-stack budget, so the "
                 "stream past that point was never read.",
                 {"skipped_reason": "pickle_walk_budget", "file_size": len(data)},
+            ))
+
+        if memo_profile.joblib_array_unread:
+            # joblib.load reads array bytes out of the middle of the stream,
+            # and the walk could not tell how many, so it never found where
+            # the loader picks the pickle up again.
+            findings.append(_skip_unverified_finding(
+                file_path,
+                "The pickle walk lost its place at a joblib array spliced into "
+                "the stream, so the rest was not read the way joblib.load reads it.",
+                {"skipped_reason": "joblib_array_unsized", "file_size": len(data)},
             ))
 
         denied = sorted({g for g in globals_found if _classify_pickle_global(g) == "denied"})
@@ -2077,7 +2339,11 @@ class ModelFileScanner:
             with zipfile.ZipFile(file_path, "r") as zf:
                 if "config.json" not in zf.namelist():
                     return []
-                raw = zf.read("config.json")
+                # Every other zip-member read here goes through
+                # _read_zip_member_capped rather than trusting the declared
+                # size: a 408KB deflated config.json expanding to 400MB of
+                # zeros drove peak RSS to 1.4GB in 0.6s.
+                raw = self._read_zip_member_capped(zf, "config.json", self.MAX_ZIP_MEMBER_BYTES)
         except zipfile.BadZipFile:
             # Not a zip at all: the extension-confusion check in scan_file
             # owns that case (it re-scans the bytes against every known magic).
@@ -2088,6 +2354,15 @@ class ModelFileScanner:
                 "The archive's config.json could not be read, so the layer "
                 "graph was never checked.",
                 metadata={"skipped_reason": "unreadable_member"},
+            )]
+
+        if raw is None:
+            return [_skip_unverified_finding(
+                file_path,
+                f"The archive's config.json exceeds the "
+                f"{self.MAX_ZIP_MEMBER_BYTES // 1_000_000}MB decompressed size limit "
+                "(possible zip bomb), so the layer graph was never checked.",
+                metadata={"skipped_reason": "oversized"},
             )]
 
         try:
@@ -2316,6 +2591,7 @@ class ModelFileScanner:
     # bounds that walk against an archive padded with millions of tiny
     # entries. Real .nemo checkpoints hold a handful of files.
     MAX_TAR_MEMBERS = 1000
+    _TORCH_TAR_PICKLES = frozenset({"sys_info", "pickle", "storages", "tensors"})
 
     def _scan_tar_pickles(self, file_path: Path) -> list[Finding]:
         """Scan the pickle streams inside a tar-based checkpoint container.
@@ -2351,6 +2627,9 @@ class ModelFileScanner:
                 hit_member_cap = False
                 member_names: list[str] = []
                 link_members: list[tuple[str, str]] = []
+                # torch.load reads each of its members by name, and
+                # tarfile.getmember returns the last member of that name.
+                last_torch_members: dict[str, tarfile.TarInfo] = {}
                 for index, member in enumerate(tf):
                     if index >= self.MAX_TAR_MEMBERS:
                         hit_member_cap = True
@@ -2366,33 +2645,33 @@ class ModelFileScanner:
                     # filter that skips them below (MFV-ARCHIVE-002).
                     if member.issym() or member.islnk():
                         link_members.append((member.name, member.linkname))
-                    if not member.isfile():
+                    if member.name in self._TORCH_TAR_PICKLES:
+                        last_torch_members[member.name] = member
+                    # extractfile serves a member of a type it does not know
+                    # as a regular file, so the loaders read those too.
+                    if member.isfile() or member.type not in tarfile.SUPPORTED_TYPES:
+                        findings.extend(self._scan_tar_member(
+                            tf, member, member.name, file_path,
+                            member.name in self._TORCH_TAR_PICKLES))
+                # extractfile follows a link to the member it names, so a
+                # torch member that is a link is read through it. Resolved once
+                # the walk is done, since a symlink may point forward.
+                for member in last_torch_members.values():
+                    if not (member.issym() or member.islnk()):
                         continue
-                    if member.size < 2 or member.size > self.MAX_ZIP_MEMBER_BYTES:
+                    target = self._tar_link_target(tf.members, member)
+                    if target is None:
+                        findings.append(_skip_unverified_finding(
+                            file_path,
+                            f"[{member.name}] Tar member is a link that torch.load "
+                            f"follows, but it resolves to no readable member of the "
+                            f"archive, so what the loader reads there was never seen.",
+                            metadata={"skipped_reason": "unresolved_link",
+                                      "tar_member": member.name},
+                        ))
                         continue
-                    try:
-                        handle = tf.extractfile(member)
-                        if handle is None:
-                            continue
-                        blob = handle.read(self.MAX_ZIP_MEMBER_BYTES)
-                    except (OSError, tarfile.TarError):
-                        continue
-                    if len(blob) < 2:
-                        continue
-
-                    if blob[:4] == self._ZIP_LOCAL_MAGIC:
-                        findings.extend(self._scan_zip_bytes(blob, member.name, file_path))
-                        continue
-                    if not blob.startswith(self._PICKLE_OPENERS):
-                        exec_hits = _find_embedded_executables(blob)
-                        if exec_hits:
-                            findings.append(self._executable_finding(
-                                file_path, exec_hits, member=member.name))
-                        continue
-                    for f in self._scan_pickle(file_path, blob):
-                        f.message = f"[{member.name}] {f.message}"
-                        f.metadata = {**(f.metadata or {}), "tar_member": member.name}
-                        findings.append(f)
+                    findings.extend(self._scan_tar_member(
+                        tf, target, f"{member.name} -> {target.name}", file_path, True))
                 # Iteration ending is not proof the file ended. A tar cut
                 # inside a member *header* stops the walk with no exception
                 # at all (measured: members before the cut are yielded, the
@@ -2453,6 +2732,96 @@ class ModelFileScanner:
                 metadata={"skipped_reason": "tar_walk_failed", "error": type(exc).__name__},
             ))
         return findings
+
+    def _scan_tar_member(
+        self, tf: tarfile.TarFile, member: tarfile.TarInfo, label: str,
+        file_path: Path, torch_member: bool,
+    ) -> list[Finding]:
+        """Scan one tar member's bytes, reporting findings under `label`.
+        `torch_member`: torch.load's legacy tar reader unpickles it by name,
+        whatever opcode it opens with."""
+        oversized = member.size > self.MAX_ZIP_MEMBER_BYTES
+        if member.size < 2 or (oversized and not torch_member):
+            return []
+        findings: list[Finding] = []
+        try:
+            handle = tf.extractfile(member)
+            blob = handle.read(self.MAX_ZIP_MEMBER_BYTES) if handle is not None else b""
+        except (OSError, tarfile.TarError):
+            if torch_member:
+                findings.append(_skip_unverified_finding(
+                    file_path,
+                    f"[{label}] Tar member that torch.load unpickles could not be read.",
+                    metadata={"skipped_reason": "unreadable", "tar_member": label},
+                ))
+            return findings
+        if oversized:
+            # A pickle is read from its start, so the capped prefix is still
+            # analysed; the rest of the member is not.
+            findings.append(Finding(
+                rule_id="MFV-SKIP-002",
+                message=f"[{label}] Tar member that torch.load unpickles is larger "
+                        f"than the {self.MAX_ZIP_MEMBER_BYTES // 1_000_000}MB member "
+                        f"limit; only its start was analysed. NOT a clean verdict "
+                        f"for the rest of it.",
+                severity=Severity.LOW,
+                category=Category.AI_ML,
+                file_path=str(file_path),
+                confidence=0.50,
+                metadata={"skipped_reason": "oversized_member", "tar_member": label,
+                          "member_size": member.size},
+            ))
+        if len(blob) < 2:
+            return findings
+
+        if blob[:4] == self._ZIP_LOCAL_MAGIC:
+            findings.extend(self._scan_zip_bytes(blob, label, file_path))
+            return findings
+        if not torch_member and not blob.startswith(self._PICKLE_OPENERS):
+            exec_hits = _find_embedded_executables(blob)
+            if exec_hits:
+                findings.append(self._executable_finding(file_path, exec_hits, member=label))
+            return findings
+        for f in self._scan_pickle(file_path, blob, loader_unpickles=torch_member):
+            f.message = f"[{label}] {f.message}"
+            f.metadata = {**(f.metadata or {}), "tar_member": label}
+            findings.append(f)
+        return findings
+
+    # tarfile.extractfile recurses through a link to a link; a cycle makes it
+    # raise, so a chain longer than this is not one a loader completes.
+    _MAX_TAR_LINK_HOPS = 8
+
+    def _tar_link_target(
+        self, members: list[tarfile.TarInfo], link: tarfile.TarInfo,
+    ) -> tarfile.TarInfo | None:
+        """The member tarfile.extractfile reads for `link`, or None.
+
+        Mirrors tarfile._find_link_target: a symlink's target is joined to the
+        link's directory and searched for across the whole archive, a hard
+        link's only among the members before it, names compared after
+        normpath and the last match winning. A link to a link is followed in
+        turn, as extractfile does.
+        """
+        member = link
+        for _ in range(self._MAX_TAR_LINK_HOPS):
+            if member.issym():
+                name = "/".join(filter(None, (os.path.dirname(member.name), member.linkname)))
+                candidates = members
+            else:
+                name = member.linkname
+                candidates = members[:members.index(member)]
+            name = os.path.normpath(name)
+            match = next(
+                (m for m in reversed(candidates) if os.path.normpath(m.name) == name), None)
+            if match is None:
+                return None
+            if match.isfile() or match.type not in tarfile.SUPPORTED_TYPES:
+                return match
+            if not (match.issym() or match.islnk()):
+                return None
+            member = match
+        return None
 
     def _scan_nested_zip_member(
         self, zf: zipfile.ZipFile, info: zipfile.ZipInfo, file_path: Path,
@@ -2558,58 +2927,6 @@ class ModelFileScanner:
                 },
             ))
         return findings
-
-    def _torch_source_finding(
-        self, file_path: Path, names: list[str],
-    ) -> Finding | None:
-        """MFV-TORCH-001: a torch zip carries executable Python source.
-
-        Conservative by construction, to avoid flagging an ordinary data
-        member: it fires only when the archive both (a) carries `*.py`
-        members and (b) looks like a torch container that would actually
-        execute them. Recognition markers are the two layouts that do:
-        torch.package's `.data/` directory and its `extern_modules` /
-        `python_version` manifest, and TorchScript's `code/` directory
-        alongside a `data.pkl` / `constants.pkl` pickle. A plain state_dict
-        checkpoint has no `.py` members at all, so it never reaches the
-        second condition.
-        """
-        source_members = [n for n in names if n.endswith(".py")]
-        if not source_members:
-            return None
-
-        # A torch container, not just any zip that happens to hold a .py.
-        # `.data/` (with a leading path segment or at the root) and a
-        # top-level `code/` are the package/TorchScript signatures; the
-        # pickle sidecars confirm it is a serialized model rather than a
-        # source tarball someone renamed.
-        def _is_torch_layout(n: str) -> bool:
-            segments = n.split("/")
-            last = segments[-1]
-            return (
-                ".data" in segments
-                or segments[0] == "code"
-                or last in ("data.pkl", "constants.pkl", "extern_modules")
-            )
-
-        if not any(_is_torch_layout(n) for n in names):
-            return None
-
-        shown = ", ".join(sorted(source_members)[:5])
-        return Finding(
-            rule_id="MFV-TORCH-001",
-            message=f"Torch archive carries executable Python source that runs "
-                    f"on load: {shown}. torch.package's PackageImporter imports "
-                    f"these modules and torch.jit compiles a TorchScript "
-                    f"`code/` directory, so loading the model executes the "
-                    f"packaged code, not just the weights.",
-            severity=Severity.HIGH,
-            category=Category.DESERIALIZATION,
-            file_path=str(file_path),
-            confidence=0.75,
-            cwe_ids=[94],
-            metadata={"source_members": sorted(source_members)[:20]},
-        )
 
     def _archive_member_name_finding(
         self, names: list[str], file_path: Path,
@@ -2783,19 +3100,13 @@ class ModelFileScanner:
             return self._scan_pickle(file_path, data)
         try:
             with zf:
-                # Before the pickle walk: a torch zip can carry executable
-                # Python *source*, not just a pickle. torch.package archives
-                # ship a `.data/` layout with `*.py` modules that
-                # PackageImporter imports on load, and a TorchScript archive
-                # ships a `code/` directory of `.py` that torch.jit compiles
-                # and runs on load. Either way the source executes when the
-                # model is loaded, so it is a code-execution surface a pickle
-                # scan alone would miss. Reported separately from the pickle
-                # findings via MFV-TORCH-001.
                 names = [info.filename for info in zf.infolist()]
-                source_finding = self._torch_source_finding(file_path, names)
-                if source_finding is not None:
-                    findings.append(source_finding)
+                sources = classify_sources(names)
+                presence = source_presence(file_path, sources)
+                if presence is not None:
+                    findings.append(presence)
+                findings.extend(package_source_findings(
+                    zf, file_path, sources.get("torch_package", [])))
                 findings.extend(self._archive_member_name_finding(
                     [info.orig_filename for info in zf.infolist()], file_path))
                 findings.extend(self._archive_link_target_finding(
@@ -2854,7 +3165,8 @@ class ModelFileScanner:
                     exec_hits = _find_embedded_executables(inner)
                     if exec_hits:
                         findings.append(self._executable_finding(file_path, exec_hits, member=name))
-                    for f in self._scan_pickle(file_path, inner):
+                    is_data_pkl = name.rsplit("/", 1)[-1] == "data.pkl"
+                    for f in self._scan_pickle(file_path, inner, loader_unpickles=is_data_pkl):
                         f.message = f"[{name}] {f.message}"
                         f.metadata = {**(f.metadata or {}), "zip_member": name}
                         findings.append(f)
@@ -3372,6 +3684,60 @@ class ModelFileScanner:
 
     _SEVENZ_MAGIC = b"7z\xBC\xAF\x27\x1C"
     _SEVENZ_MAX_TOTAL_BYTES = 500_000_000
+    _SEVENZ_MAX_ARCHIVE_BYTES = 500_000_000
+    _SEVENZ_MAX_MEMBERS = 1000
+    _SEVENZ_MAX_LISTING_BYTES = 2_000_000
+
+    @staticmethod
+    def _run_capped_output(argv: list[str], timeout: int, max_bytes: int):
+        """Run a command, killing it as soon as its output exceeds max_bytes.
+
+        Returns (returncode, output, overflowed)."""
+        proc = subprocess.Popen(  # noqa: S603 - callers pass a fixed argv with "--"
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        captured = bytearray()
+        overflow = False
+
+        def _drain() -> None:
+            nonlocal overflow
+            if proc.stdout is None:
+                return
+            while chunk := proc.stdout.read(64 * 1024):
+                room = max_bytes + 1 - len(captured)
+                if room > 0:
+                    captured.extend(chunk[:room])
+                if len(captured) > max_bytes or len(chunk) > room:
+                    overflow = True
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+                    break
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            reader.join()
+            raise
+        reader.join()
+        return returncode, bytes(captured[:max_bytes]), overflow
+
+    @staticmethod
+    def _tree_bytes(root: str) -> tuple[int, int, int]:
+        """(total, largest, count) of the entries under root, links not followed."""
+        total = largest = count = 0
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                count += 1
+                with contextlib.suppress(OSError):
+                    st = os.lstat(os.path.join(dirpath, name))
+                    if stat.S_ISREG(st.st_mode):
+                        total += st.st_size
+                        largest = max(largest, st.st_size)
+        return total, largest, count
 
     # 7z is the one container that re-enters scan_file on what it extracts, so
     # an archive containing an archive recurses. Measured with a stub extractor
@@ -3402,6 +3768,16 @@ class ModelFileScanner:
             )]
         if head != self._SEVENZ_MAGIC:
             return []
+        try:
+            archive_bytes = file_path.stat().st_size
+        except OSError:
+            archive_bytes = self._SEVENZ_MAX_ARCHIVE_BYTES + 1
+        if archive_bytes > self._SEVENZ_MAX_ARCHIVE_BYTES:
+            return [_skip_unverified_finding(
+                file_path,
+                "The 7z archive exceeds the input size limit, so it was not extracted.",
+                metadata={"skipped_reason": "oversized_archive"},
+            )]
 
         if self._archive_depth >= self.MAX_ARCHIVE_DEPTH:
             return [_skip_unverified_finding(
@@ -3427,28 +3803,52 @@ class ModelFileScanner:
                 metadata={"skipped_reason": "no_extractor"},
             )]
 
-        with tempfile.TemporaryDirectory() as tmp:
+        # On Windows a killed extractor (or its child) can still hold files
+        # for a moment, and a failed cleanup must not replace the verdict.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            # The listing is attacker-shaped output, so it fails closed: a
+            # listing that errors, overflows, or carries a non-numeric size is
+            # a reason not to extract, never a reason to assume zero bytes.
             try:
-                listing = subprocess.run(  # noqa: S603 - fixed argv, no shell, "--" guards the path
+                code, raw_listing, overflow = self._run_capped_output(
                     # `--` stops switch parsing: a scanned file named
                     # "-o/tmp/x.7z" would otherwise reach 7-Zip as a flag.
                     [extractor, "l", "-slt", "--", str(file_path)],
-                    capture_output=True, text=True, timeout=60, check=False,
+                    60, self._SEVENZ_MAX_LISTING_BYTES,
                 )
             except (OSError, subprocess.TimeoutExpired):
-                listing = None
-            if listing is not None and listing.returncode == 0:
-                total = 0
-                for line in listing.stdout.splitlines():
-                    if not line.startswith("Size ="):
-                        continue
+                code, raw_listing, overflow = -1, b"", False
+            if overflow:
+                return [_skip_unverified_finding(
+                    file_path, "The 7z listing exceeds the output limit, so the archive was not extracted.",
+                    metadata={"skipped_reason": "excessive_listing"},
+                )]
+            if code != 0:
+                return [_skip_unverified_finding(
+                    file_path, "The 7z listing failed, so the archive was not extracted.",
+                    metadata={"skipped_reason": "listing_failed"},
+                )]
+            text = raw_listing.decode("utf-8", errors="replace")
+            members = [line for line in text.splitlines() if line.startswith("Path =")][1:]
+            if len(members) > self._SEVENZ_MAX_MEMBERS:
+                return [_skip_unverified_finding(
+                    file_path, "The 7z archive has too many members, so it was not extracted.",
+                    metadata={"skipped_reason": "excessive_members", "members": len(members)},
+                )]
+            sizes: list[int] = []
+            for line in text.splitlines():
+                if line.startswith("Size ="):
                     # A non-numeric Size= line (attacker-chosen extractor
-                    # output shape) raises ValueError; it counts as zero
-                    # rather than aborting the scan.
+                    # output shape) counts as zero rather than aborting the
+                    # scan; the extraction quota below bounds what it writes.
                     with contextlib.suppress(ValueError):
-                        total += int(line.split("=", 1)[1].strip() or 0)
-            else:
-                total = 0
+                        sizes.append(int(line.split("=", 1)[1].strip() or 0))
+            if any(size > self.MAX_ZIP_MEMBER_BYTES for size in sizes):
+                return [_skip_unverified_finding(
+                    file_path, "The 7z archive contains an oversized member, so it was not extracted.",
+                    metadata={"skipped_reason": "oversized_member"},
+                )]
+            total = sum(sizes)
             if total > self._SEVENZ_MAX_TOTAL_BYTES:
                 return [Finding(
                     rule_id="MFV-7Z-001",
@@ -3461,23 +3861,68 @@ class ModelFileScanner:
                     confidence=0.5,
                     metadata={"skipped_reason": "oversized", "claimed_total": total},
                 )]
+
+            # The listing's sizes are claims. Watch what extraction actually
+            # writes and kill it once a member or the total passes the cap.
+            # The tree is measured every 50ms and again after exit, so on a
+            # fast disk it can overshoot by one interval's writes.
+            def _over_quota() -> bool:
+                written, largest, count = self._tree_bytes(tmp)
+                return (written > self._SEVENZ_MAX_TOTAL_BYTES
+                        or largest > self.MAX_ZIP_MEMBER_BYTES
+                        or count > self._SEVENZ_MAX_MEMBERS)
+
+            # stderr goes to a file, not a pipe: nothing reads a pipe while
+            # the loop below polls, so a chatty extractor would block on a
+            # full pipe buffer until the timeout.
+            err_log = tempfile.TemporaryFile()  # noqa: SIM115 - closed below
             try:
-                proc = subprocess.run(  # noqa: S603 - fixed argv, no shell, "--" guards the path
+                proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell, "--" guards the path
                     [extractor, "x", "-y", f"-o{tmp}", "--", str(file_path)],
-                    capture_output=True, text=True, timeout=300, check=False,
+                    stdout=subprocess.DEVNULL, stderr=err_log,
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            except OSError as exc:
+                err_log.close()
                 return [_skip_unverified_finding(
                     file_path,
                     f"7z extraction failed ({type(exc).__name__}).",
                     metadata={"skipped_reason": "extract_failed"},
                 )]
+            deadline = time.monotonic() + 300
+            quota_hit = False
+            while proc.poll() is None:
+                if _over_quota():
+                    quota_hit = True
+                    break
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    err_log.close()
+                    return [_skip_unverified_finding(
+                        file_path,
+                        "7z extraction failed (TimeoutExpired).",
+                        metadata={"skipped_reason": "extract_failed"},
+                    )]
+                time.sleep(0.05)
+            if quota_hit or _over_quota():
+                proc.kill()
+                proc.wait()
+                err_log.close()
+                return [_skip_unverified_finding(
+                    file_path,
+                    "7z extraction wrote more than the size or file-count limit, so it was stopped "
+                    "and the archive was not scanned.",
+                    metadata={"skipped_reason": "extraction_quota"},
+                )]
+            err_log.seek(0)
+            stderr = err_log.read(200).decode("utf-8", errors="replace")
+            err_log.close()
             if proc.returncode != 0:
                 return [_skip_unverified_finding(
                     file_path,
                     "7z extraction failed.",
                     metadata={"skipped_reason": "extract_failed",
-                              "stderr": proc.stderr[:200]},
+                              "stderr": stderr[:200]},
                 )]
 
             findings: list[Finding] = []
@@ -3555,6 +4000,15 @@ class ModelFileScanner:
     # verdict as any other header literal_eval rejects.
     _NPY_MAX_HEADER_BYTES = 1 << 20
 
+    def _npy_header_present(self, data: bytes) -> bool:
+        """Whether the whole header a .npy declares is in `data`. numpy cannot
+        read a file cut inside its header, so nothing there is unpickled."""
+        size_len = 2 if data[6:7] == b"\x01" else 4
+        if len(data) < 8 + size_len:
+            return False
+        header_len = int.from_bytes(data[8:8 + size_len], "little")
+        return 8 + size_len + header_len <= len(data)
+
     def _parse_npy_header(self, data: bytes) -> tuple[dict[str, Any], int] | None:
         """Parse a .npy file's header dict and return (header, data_offset).
 
@@ -3581,10 +4035,19 @@ class ModelFileScanner:
         header_end = header_start + header_len
         if header_end > len(data):
             return None
+        # numpy's _read_array_header: format 3.0 headers are UTF-8, and for
+        # 1.0/2.0 a header that does not parse is retried with the Python 2
+        # `L` long suffix stripped from its integers.
         try:
-            header = ast.literal_eval(data[header_start:header_end].decode("latin1").strip())
+            text = data[header_start:header_end].decode("utf8" if major >= 3 else "latin1")
+            try:
+                header = ast.literal_eval(text.strip())
+            except SyntaxError:
+                if major > 2:
+                    raise
+                header = ast.literal_eval(_strip_python2_longs(text).strip())
         except (ValueError, SyntaxError, UnicodeDecodeError, MemoryError,
-                RecursionError):
+                RecursionError, tokenize.TokenError):
             # MemoryError/RecursionError: the header literal is
             # attacker-shaped (a 1MB nest of braces reaches both) and the
             # verdict for it is the same as for any unparseable header.
@@ -3596,15 +4059,26 @@ class ModelFileScanner:
     def _scan_npy_bytes(self, file_path: Path, data: bytes, member: str = "") -> list[Finding]:
         parsed = self._parse_npy_header(data)
         if parsed is None:
-            return []
+            if data[:6] != self._NPY_MAGIC or not self._npy_header_present(data):
+                return []
+            # A header numpy.load(allow_pickle=True) might read and this parse
+            # cannot (allow_pickle also lifts numpy's header size limit).
+            finding = _skip_unverified_finding(
+                file_path,
+                f"{f'[{member}] ' if member else ''}The .npy header could not be "
+                f"parsed, so whether the array data is a pickle was never decided.",
+                metadata={"skipped_reason": "npy_header_unparsed",
+                          **({"zip_member": member} if member else {})},
+            )
+            return [finding]
         header, data_offset = parsed
-        descr = str(header.get("descr", ""))
-        if "O" not in descr:
+        if not _npy_descr_has_object(header.get("descr", "")):
             # Numeric/fixed-width dtype -- the data section is raw array
             # bytes, not a pickle stream; nothing to scan.
             return []
 
-        findings = self._scan_pickle(file_path, data[data_offset:])
+        # numpy.load(allow_pickle=True) unpickles everything past the header.
+        findings = self._scan_pickle(file_path, data[data_offset:], loader_unpickles=True)
         if member:
             for f in findings:
                 f.message = f"[{member}] {f.message}"
@@ -3681,21 +4155,26 @@ class ModelFileScanner:
         """`numpy.load(..., allow_pickle=True)` on an object-dtype array is a
         pickle load in disguise -- numpy serializes an object-dtype array's
         elements via pickle.dump, so the .npy data section past the header
-        is a real pickle stream once descr indicates dtype=object."""
-        if file_path.suffix.lower() == ".npz":
+        is a real pickle stream once descr indicates dtype=object.
+
+        Container or array is decided by the first bytes, the way numpy.load
+        decides it, not by the extension: an object .npy named `.npz` is still
+        unpickled, and so is a zip named `.npy`."""
+        if data[:4] in _NPZ_MAGICS:
             findings: list[Finding] = []
             try:
                 zf = zipfile.ZipFile(file_path, "r")
             except (zipfile.BadZipFile, OSError):
-                # Not a zip at all: the extension-confusion check in
-                # scan_file owns that case for .npz.
+                # Zip magic but not a zip: the extension-confusion check
+                # in scan_file owns that case.
                 return []
             try:
                 with zf:
                     findings.extend(self._check_npz_container(zf, file_path))
+                    # Every member, not only `*.npy`: NpzFile serves any
+                    # member by its full name and unpickles it when it opens
+                    # with the .npy magic. _scan_npy_bytes skips the rest.
                     for name in zf.namelist():
-                        if not name.endswith(".npy"):
-                            continue
                         try:
                             member_data = self._read_zip_member_capped(zf, name, self.MAX_ZIP_MEMBER_BYTES)
                         except (OSError, zipfile.BadZipFile, RuntimeError, ValueError, EOFError):
@@ -3723,83 +4202,93 @@ class ModelFileScanner:
     # ── joblib scanning ────────────────────────────────────────────
 
     def _decompress_capped(self, data: bytes, max_bytes: int,
-                           codec: str = "zlib") -> bytes | None:
+                           codec: str = "zlib") -> tuple[bytes | None, bool]:
         """Bounded decompression for any codec joblib writes.
 
-        Same contract as the zlib-only version it generalises: chunked, and
-        None once the output would exceed the cap, so a small archive cannot
-        expand into a memory-exhausting payload.
+        Returns (output, complete). Same contract as the zlib-only version it
+        generalises: chunked, and None output once it would exceed the cap,
+        so a small archive cannot expand into a memory-exhausting payload.
+
+        Concatenated streams are read in sequence: joblib reads bz2, xz and
+        lzma through the standard library's readers, which carry on into a
+        following stream, so a pickle split across two streams is unpickled
+        whole. lzma.LZMAFile decodes each following stream in either format
+        (FORMAT_AUTO), whichever the first one was. For those three codecs a
+        following stream that does not decompress returns complete=False: the
+        reader stops there or raises partway, and what came before it has run
+        either way. Zero bytes after a stream decode to nothing and end it
+        cleanly. An error in the first stream still raises.
         """
+        view = memoryview(data)
         decompressor = _new_decompressor(codec)
         out = bytearray()
         step = 1 << 20
-        for offset in range(0, len(data), step):
-            chunk = data[offset:offset + step]
-            produced = decompressor.decompress(chunk, max_bytes - len(out) + 1)
+        offset = stream_start = 0
+        first_stream = True
+        complete = True
+        while offset < len(data):
+            chunk = view[offset:offset + step]
+            offset += len(chunk)
+            try:
+                produced = decompressor.decompress(chunk, max_bytes - len(out) + 1)
+            except (zlib.error, OSError, EOFError, lzma.LZMAError):
+                if first_stream:
+                    raise
+                padding = data.count(b"\x00", stream_start) == len(data) - stream_start
+                if codec in ("bz2", "xz", "lzma") and not padding:
+                    complete = False
+                break
             out.extend(produced)
             if len(out) > max_bytes:
-                return None
+                return None, complete
             if getattr(decompressor, "eof", False):
-                break
-        return bytes(out)
-
-    def _decompress_zlib_capped(self, data: bytes, max_bytes: int) -> bytes | None:
-        """Inflate a raw zlib stream in bounded chunks, aborting once
-        max_bytes is exceeded.
-
-        Mirrors ``_read_zip_member_capped``: DEFLATE's declared/compressed
-        size can't be trusted as a proxy for its decompressed size (worst-case
-        expansion is roughly 1000:1+), so a naive ``zlib.decompress(data)``
-        call can be handed a small, well-under-the-file-size-cap payload that
-        still exhausts memory on load. ``decompressobj.decompress(buf,
-        max_length)`` only inflates up to ``max_length`` bytes per call and
-        leaves the rest of the not-yet-processed input in
-        ``unconsumed_tail`` -- feed that back in on the next call and stop as
-        soon as the running total crosses the cap, instead of ever
-        materializing the full inflated buffer.
-        """
-        decompressor = zlib.decompressobj()
-        chunks: list[bytes] = []
-        total = 0
-        chunk_size = 1_000_000
-        pending = data
-        while True:
-            out = decompressor.decompress(pending, chunk_size)
-            total += len(out)
-            if total > max_bytes:
-                return None
-            chunks.append(out)
-            pending = decompressor.unconsumed_tail
-            if not pending:
-                break
-        tail = decompressor.flush()
-        total += len(tail)
-        if total > max_bytes:
-            return None
-        chunks.append(tail)
-        return b"".join(chunks)
+                offset -= len(decompressor.unused_data)
+                if offset <= stream_start:
+                    break  # a stream that consumed nothing: stop, never spin
+                if codec in ("xz", "lzma"):
+                    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO)
+                else:
+                    decompressor = _new_decompressor(codec)
+                stream_start = offset
+                first_stream = False
+        return bytes(out), complete
 
     def _scan_joblib(self, file_path: Path, data: bytes) -> list[Finding]:
         """joblib.dump() without compression writes a plain pickle stream;
         with compress= set, it wraps a zlib-compressed pickle behind a zlib
         magic header. Both routes ultimately end in a real pickle stream,
         so both are handed to the same hardened callable-resolution scanner
-        pickle.loads() itself uses -- this doesn't attempt joblib's other
-        compressor backends (lz4, blosc) or its large-array memmap chunking,
-        best-effort per issue #77's own scope.
+        pickle.loads() itself uses. gzip, bz2, xz, lzma and the pre-0.10
+        "ZF" layout are decompressed the same way; lz4 needs a third-party
+        codec, so an lz4 file is reported as unread rather than attempted.
 
         Decompression is bounded the same way `_read_zip_member_capped`
         bounds zip-backed formats (DEF-33): a small, well-under-the-file-size
         -cap compressed stream can still expand into a memory-exhausting
         payload, so this never calls the unbounded `zlib.decompress`.
         """
-        codec = _sniff_compression(data)
+        codec, stream = _joblib_compression(data)
+        if codec == "lz4":
+            return [_skip_unverified_finding(
+                file_path,
+                "joblib file is lz4-compressed, which this scanner cannot "
+                "decompress, so the pickle inside was never read.",
+                metadata={"skipped_reason": "unsupported_compression"},
+            )]
         if codec is not None:
             try:
-                decompressed = self._decompress_capped(
-                    data, self.MAX_ZIP_MEMBER_BYTES, codec)
+                decompressed, complete = self._decompress_capped(
+                    stream, self.MAX_ZIP_MEMBER_BYTES, codec)
             except (zlib.error, OSError, EOFError, lzma.LZMAError):
-                pass
+                # joblib unpickles as it decompresses, so whatever precedes
+                # the corruption still runs. The raw bytes are scanned too,
+                # since pickle.load and torch.load read them undecompressed.
+                return [_skip_unverified_finding(
+                    file_path,
+                    f"The {codec}-compressed stream could not be decompressed, "
+                    f"so the pickle inside was never fully read.",
+                    metadata={"skipped_reason": "decompression_failed"},
+                )] + self._scan_pickle(file_path, data)
             else:
                 if decompressed is None:
                     return [Finding(
@@ -3813,5 +4302,12 @@ class ModelFileScanner:
                         confidence=0.6,
                         metadata={"skipped_reason": "oversized_decompressed"},
                     )]
-                return self._scan_pickle(file_path, decompressed)
-        return self._scan_pickle(file_path, data)
+                stream = decompressed
+                if not complete:
+                    return [_skip_unverified_finding(
+                        file_path,
+                        f"A later {codec}-compressed stream in the file could not be "
+                        f"decompressed, so the data from there on was never read.",
+                        metadata={"skipped_reason": "decompression_incomplete"},
+                    )] + self._scan_pickle(file_path, stream, loader_unpickles=True)
+        return self._scan_pickle(file_path, stream, loader_unpickles=True)

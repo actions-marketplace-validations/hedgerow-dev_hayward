@@ -129,23 +129,19 @@ model-scan:
 
 ### Pre-commit
 
-`hayward scan` accepts several targets, but a hook that forwarded every staged
-filename would scan unrelated files. Scan your models directory instead and use
-`pass_filenames: false`; the `files` pattern then only controls *when* the
-hook runs (whenever a matching file is staged). Point the entry at whatever
-directory holds your model files.
+Add Hayward to `.pre-commit-config.yaml`:
 
 ```yaml
 repos:
-  - repo: local
+  - repo: https://github.com/hedgerow-dev/hayward
+    rev: v1.2.6
     hooks:
       - id: hayward
-        name: scan model files
-        entry: hayward scan ./models --fail-on high
-        language: system
-        pass_filenames: false
-        files: '\.(pt|pth|pkl|bin|safetensors|gguf|h5|keras|onnx|npy|npz|joblib)$'
 ```
+
+The hook scans each staged file whose extension Hayward reads and blocks the
+commit on any finding at `high` or above. To change the threshold, override
+`args`, for example `args: [--fail-on, critical]`.
 
 ## Desktop
 
@@ -163,6 +159,25 @@ checkbox controls whether INFO findings are listed, the same choice the CLI's
 Built on tkinter, which ships with Python, so the desktop app adds no
 dependency. The scan runs on a worker thread, so a large directory does not
 freeze the window.
+
+## Coding agents (MCP)
+
+```bash
+pip install "hayward[mcp]"
+claude mcp add hayward -- hayward mcp
+```
+
+`hayward mcp` runs a stdio MCP server with one tool, `scan_path(path,
+fail_on="high")`. It returns JSON with the findings and a `verdict`:
+
+- `blocked`: a finding at or above `fail_on`, the same gate as `--fail-on`.
+- `incomplete`: nothing reached the gate, but a file was not fully read.
+- `clean`: neither.
+
+A missing path comes back as a tool error. The tool is read-only, never loads
+the model and makes no network calls, so an agent can be told to scan any
+model file before loading it. The extra adds the official MCP Python SDK
+(MIT); the core install is unchanged.
 
 ## Python
 
@@ -205,6 +220,98 @@ for f in sorted(findings, key=lambda f: f.severity_order):
 
 Importing the package is cheap: one dependency, no model framework and no
 native extensions, so calling it per file in a loop is fine.
+
+## Load guard
+
+```python
+import hayward.guard  # one line, top of a notebook or script
+```
+
+From then on four loaders are guarded:
+
+- `pickle.load`
+- `joblib.load`
+- `numpy.load`, only when `allow_pickle=True`
+- `torch.load`
+
+Each guarded call does two checks. First it scans the file the way that
+loader will read it, and refuses it on a finding at or above `high`. Then,
+while the loader runs, every global the unpickler resolves on that thread is
+checked before it is imported, so a file the scan read differently from the
+loader is still caught when it names a denied callable.
+
+A refused load raises `hayward.guard.UnsafeModelError`, a subclass of
+`pickle.UnpicklingError`, so an existing `except` around a load still
+catches it. The message is the CLI's text for the findings; `.file` and
+`.rule_ids` carry the same detail.
+
+```python
+import hayward.guard
+
+hayward.guard.install(strict=True)             # refuse anything not known-safe
+hayward.guard.install(fail_on="critical")      # same scale as --fail-on
+hayward.guard.install(mode="warn")             # warnings.warn, then load anyway
+hayward.guard.install(max_size=2_000_000_000)  # raise the scan's 500MB cap, in bytes
+hayward.guard.install(prescan=False)           # keep only the load-time check
+hayward.guard.uninstall()                      # restore the original loaders
+```
+
+Each `install` call replaces the previous settings. A denied callable is
+CRITICAL, so outside strict mode `fail_on="never"` lets it load, like warn
+mode without the warning. `HAYWARD_GUARD=off` makes the import a no-op, for
+CI that already scans.
+
+### Default mode raises the bar; it is not a sandbox
+
+By default the guard refuses denied callables and anything the scan rates
+at or above `fail_on`. A global on neither the deny list nor the known-safe
+list loads, as it is INFO in the CLI. That is enough to stop known malicious
+files and the parser tricks the scanner has been tested against. It is not
+enough for a file from someone you do not trust: a pickle built only from
+unrecognized globals can still run code, including by reaching the guard's
+own state from inside the load. The scan catches some of those from their
+arguments, not all of them.
+
+### Strict mode
+
+`install(strict=True)` refuses every global that is not on the scanner's
+known-safe list, the list behind `MFV-PICKLE-004`. It applies at load time
+and to the scan's `MFV-PICKLE-004` and `MFV-PICKLE-005` findings, whatever
+`fail_on` is. This is the setting for files you do not trust.
+
+It refuses some ordinary files. What loads: built-in containers, numpy
+arrays, torch tensors and state dicts, standard-library values such as
+`datetime`, `decimal`, `uuid` and `pathlib`, class-shaped objects from
+scikit-learn and SciPy, and transformers' `TrainingArguments`. What it
+refuses includes pandas objects, numpy random generator state, other
+transformers objects, a whole pickled `nn.Module`, TorchScript archives and
+your own classes. Strict mode trusts the known-safe list, including its
+name-shape rule for scikit-learn and SciPy.
+
+### What it does not cover
+
+- Unpickling that does not go through a guarded loader is untouched in both
+  modes: `pickle.loads`, an `Unpickler` used directly, and dill's and
+  cloudpickle's own load functions. This keeps in-process IPC, caches and
+  multiprocessing working. They are checked only when they run inside a
+  guarded load on the same thread.
+- A loader bound before the guard was installed (`from pickle import load`,
+  or a library that kept its own reference) or called by another name, such
+  as `torch.serialization.load`.
+- TorchScript. `torch.load` hands a TorchScript archive to `torch.jit.load`,
+  which unpickles in C++ where the load-time check cannot see. Only the scan
+  covers it.
+- `torch.load(weights_only=True)` uses torch's own restricted unpickler; the
+  scan still runs, the load-time check does not.
+- In default mode, work a pickle hands to another thread.
+- A stream that cannot seek is not scanned first; the load-time check still
+  applies. A file the scan could not fully read (a coverage finding,
+  `MFV-SKIP-*`) warns and loads, with the load-time check still on.
+
+The scan reads the whole file before the loader does, so on a large file it
+costs more than the load. A path is remembered for the life of the process
+by path, size and mtime, so reloading the same checkpoint does not rescan
+it.
 
 ## Excluding paths
 
